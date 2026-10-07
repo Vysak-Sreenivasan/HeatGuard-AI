@@ -67,7 +67,7 @@ def _log_node(
 
 
 async def _run_tool_loop(
-    llm_with_tools: BaseChatModel,
+    llm_with_tools: Any,
     tools: list[BaseTool],
     messages: list[Any],
     *,
@@ -122,7 +122,7 @@ async def _run_tool_loop(
                         tool.ainvoke(tool_args),
                         timeout=tool_timeout_s,
                     )
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     tool_result = f"Error: tool '{tool_name}' timed out after {tool_timeout_s}s"
                 except Exception as exc:  # noqa: BLE001
                     tool_result = f"Error calling '{tool_name}': {exc}"
@@ -208,7 +208,7 @@ async def read_worker(
             tool_timeout_s=settings.agent_tool_timeout_s,
             request_timeout_s=settings.agent_request_timeout_s,
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         latency = int((time.monotonic() - t0) * 1000)
         _log_node("read_worker", state, latency_ms=latency, extra="timeout")
         return {"final_response": "⚠ Request timed out. Please try a simpler question."}
@@ -225,7 +225,7 @@ async def read_worker(
 async def orchestrator_node(
     state: HeatGuardState,
     llm: BaseChatModel,
-) -> list[Send]:
+) -> dict[str, Any]:
     """Split a compound question and emit Send for parallel fan-out.
 
     Returns a list of Send commands — one per sub-question.
@@ -257,15 +257,18 @@ async def orchestrator_node(
 
     latency = int((time.monotonic() - t0) * 1000)
     _log_node("orchestrator_node", state, latency_ms=latency, extra=f"n={len(sub_questions)}")
+    return {"sub_questions": sub_questions}
 
-    # Emit one Send per sub-question
+
+def dispatch_workers(state: HeatGuardState) -> list[Send]:
+    """Emit one Send per sub-question for parallel fan-out."""
+    sub_questions = state.get("sub_questions", [])
     return [
         Send(
             "parallel_read_worker",
             {
                 **state,
                 "user_message": q,
-                "sub_questions": sub_questions,
             },
         )
         for q in sub_questions
@@ -301,7 +304,7 @@ async def parallel_read_worker(
             tool_timeout_s=settings.agent_tool_timeout_s,
             request_timeout_s=settings.agent_request_timeout_s,
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         latency = int((time.monotonic() - t0) * 1000)
         _log_node("parallel_read_worker", state, latency_ms=latency, extra="timeout")
         return {"tool_results": [f"⚠ Sub-question timed out: {user_message}"]}

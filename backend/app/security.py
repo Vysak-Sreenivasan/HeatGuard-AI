@@ -20,7 +20,6 @@ from typing import Any
 
 from app.config import get_settings
 
-
 # ---------------------------------------------------------------------------
 # Canonical JSON serialization (must match the gateway's implementation)
 # ---------------------------------------------------------------------------

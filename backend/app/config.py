@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 from functools import lru_cache
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -114,10 +114,21 @@ class Settings(BaseSettings):
     llm_temperature: float = Field(default=0.0, description="Temperature for router/parser calls.")
 
     # ---- Computed ----------------------------------------------------------
+    def __init__(self, **data: Any) -> None:
+        if "llm_tool_allowlist" in data and "llm_tool_allowlist_str" not in data:
+            val = data.pop("llm_tool_allowlist")
+            if isinstance(val, (list, tuple, set)):
+                data["llm_tool_allowlist_str"] = ",".join(str(x) for x in val)
+            else:
+                data["llm_tool_allowlist_str"] = str(val)
+        super().__init__(**data)
+
     @field_validator("llm_tool_allowlist_str", mode="before")
     @classmethod
-    def _strip(cls, v: str) -> str:
-        return v.strip()
+    def _strip(cls, v: Any) -> str:
+        if isinstance(v, (list, tuple, set)):
+            return ",".join(str(x).strip() for x in v)
+        return str(v).strip()
 
     @property
     def llm_tool_allowlist(self) -> list[str]:

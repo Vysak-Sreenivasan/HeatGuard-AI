@@ -1,0 +1,52 @@
+# ---------- Secrets and local config (never commit) ----------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+.python-version
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# uv: keep uv.lock committed (do not ignore it)
+
+# ---------- Node / React / Vite ----------
+node_modules/
+frontend/dist/
+frontend/build/
+frontend/.vite/
+frontend/coverage/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+# Keep package-lock.json / pnpm-lock.yaml committed
+
+# ---------- Docker and local data ----------
+docker-compose.override.yml
+pgdata/
+postgres-data/
+*.sqlite
+*.sqli
+test/

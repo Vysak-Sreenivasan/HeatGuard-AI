@@ -23,11 +23,11 @@ from typing import Any
 from langchain_core.language_models import BaseChatModel
 from langchain_core.tools import BaseTool
 from langgraph.graph import END, START, StateGraph
-from langgraph.types import Send
 
 from app.agent.nodes import (
     aggregator_node,
     chitchat_worker,
+    dispatch_workers,
     orchestrator_node,
     parallel_read_worker,
     read_worker,
@@ -53,16 +53,16 @@ def build_llm(settings: Settings | None = None) -> BaseChatModel:
 
         return ChatOpenAI(
             model=cfg.openai_model,
-            api_key=cfg.openai_api_key.get_secret_value(),
+            api_key=cfg.openai_api_key,
             temperature=cfg.llm_temperature,
         )
 
     if cfg.llm_provider == "anthropic":
         from langchain_anthropic import ChatAnthropic
 
-        return ChatAnthropic(
-            model=cfg.anthropic_model,
-            api_key=cfg.anthropic_api_key.get_secret_value(),
+        return ChatAnthropic(  # type: ignore[call-arg]
+            model_name=cfg.anthropic_model,
+            api_key=cfg.anthropic_api_key,
             temperature=cfg.llm_temperature,
         )
 
@@ -85,13 +85,16 @@ def build_graph(
     tools: list[BaseTool],
     llm: BaseChatModel | None = None,
     settings: Settings | None = None,
+    checkpointer: Any | None = None,
 ) -> Any:
     """Build and compile the HeatGuard LangGraph agent.
 
     Args:
-        tools:    Read-only LLM tools from MCPClient.get_llm_tools().
-        llm:      Optional pre-built LLM (built from settings if not provided).
-        settings: Optional settings override.
+        tools:        Read-only LLM tools from MCPClient.get_llm_tools().
+        llm:          Optional pre-built LLM (built from settings if not provided).
+        settings:     Optional settings override.
+        checkpointer: AsyncPostgresSaver instance for persistent checkpointing
+                      (required for interrupt/resume; Phase 4.3).
 
     Returns:
         Compiled LangGraph graph (CompiledGraph).
@@ -137,10 +140,10 @@ def build_graph(
         },
     )
 
-    # Orchestrator emits Send objects — LangGraph handles fan-out
+    # Orchestrator emits Send objects via dispatch_workers — LangGraph handles fan-out
     builder.add_conditional_edges(
         "orchestrator_node",
-        lambda state: [Send("parallel_read_worker", state)],  # overridden by node return value
+        dispatch_workers,  # type: ignore[arg-type]
         ["parallel_read_worker"],
     )
 
@@ -149,10 +152,12 @@ def build_graph(
     builder.add_edge("read_worker", END)
     builder.add_edge("aggregator_node", END)
 
-    graph = builder.compile()
+    # Pass the checkpointer if provided (needed for interrupt() / resume)
+    graph = builder.compile(checkpointer=checkpointer)
     logger.info(
-        "Agent graph compiled: provider=%s tools=%s",
+        "Agent graph compiled: provider=%s tools=%s checkpointer=%s",
         cfg.llm_provider,
         [t.name for t in tools],
+        "postgres" if checkpointer is not None else "none",
     )
     return graph

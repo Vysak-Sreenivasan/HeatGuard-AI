@@ -25,10 +25,12 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import Any, AsyncGenerator
+from typing import Any
 
 import structlog
+import yaml
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -37,7 +39,10 @@ from pydantic import BaseModel, Field
 from app.agent.graph import build_graph, build_llm
 from app.agent.state import HeatGuardState
 from app.agent.tools import build_llm_tools
+from app.automation.policy import PolicyConfig, load_policy_config
+from app.automation.registry import DeviceRegistry
 from app.config import get_settings
+from app.db import create_app_tables, setup_checkpointer
 from app.mcp_client import MCPConnectionError, close_mcp_client, init_mcp_client
 
 # ---------------------------------------------------------------------------
@@ -72,7 +77,29 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     settings = get_settings()
     logger.info("HeatGuard AI starting up | provider=%s", settings.llm_provider)
 
-    # 1. Connect MCP client
+    # 1. Set up database tables + LangGraph checkpointer (Phase 4.3)
+    checkpointer = None
+    try:
+        await create_app_tables(settings.database_url)
+        checkpointer = await setup_checkpointer(settings.database_url)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Database setup failed: %s", exc)
+        logger.warning("Starting without Postgres checkpointer — interrupt/resume disabled")
+
+    # 2. Load policy config from policy.yaml (Phase 6.1)
+    policy_config: PolicyConfig = PolicyConfig()  # safe defaults
+    try:
+        import os
+
+        policy_path = os.path.join(os.path.dirname(__file__), "policy.yaml")
+        with open(policy_path) as f:
+            policy_data = yaml.safe_load(f) or {}
+        policy_config = load_policy_config(policy_data)
+        logger.info("Policy loaded: version=%s", policy_config.version)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Failed to load policy.yaml, using safe defaults: %s", exc)
+
+    # 3. Connect MCP client
     try:
         mcp_client = await init_mcp_client(settings)
     except MCPConnectionError as exc:
@@ -80,13 +107,27 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.warning("Starting without MCP connection — /health will report disconnected")
         mcp_client = None
 
-    # 2. Build LLM and agent graph (only if MCP connected)
+    # 4. Build device registry (Phase 4.1)
+    registry: DeviceRegistry | None = None
+    if mcp_client is not None:
+        registry = DeviceRegistry(mcp_client=mcp_client, ttl_seconds=60.0)
+        try:
+            await registry.refresh()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Initial registry load failed (will retry on next request): %s", exc)
+
+    # 5. Build LLM and agent graph (only if MCP connected)
     global _GRAPH  # noqa: PLW0603
     if mcp_client is not None:
         try:
             tools = build_llm_tools(mcp_client)
             llm = build_llm(settings)
-            _GRAPH = build_graph(tools=tools, llm=llm, settings=settings)
+            _GRAPH = build_graph(
+                tools=tools,
+                llm=llm,
+                settings=settings,
+                checkpointer=checkpointer,
+            )
             logger.info("Agent graph ready")
         except Exception as exc:  # noqa: BLE001
             logger.error("Failed to build agent graph: %s", exc)
@@ -94,9 +135,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     else:
         _GRAPH = None
 
-    # Store in app state for access in routes
+    # Store in app.state for access in routes
     app.state.mcp_client = mcp_client
     app.state.graph = _GRAPH
+    app.state.registry = registry
+    app.state.policy_config = policy_config
+    app.state.checkpointer = checkpointer
 
     yield
 
@@ -149,6 +193,8 @@ async def health(request: Request) -> dict[str, Any]:
     """Public health endpoint (no auth required)."""
     settings = get_settings()
     mcp_client = getattr(request.app.state, "mcp_client", None)
+    registry: DeviceRegistry | None = getattr(request.app.state, "registry", None)
+    policy_config = getattr(request.app.state, "policy_config", None)
     mcp_status = "connected" if (mcp_client and mcp_client.is_connected) else "disconnected"
 
     return {
@@ -156,6 +202,76 @@ async def health(request: Request) -> dict[str, Any]:
         "mcp": mcp_status,
         "llm_provider": settings.llm_provider,
         "agent_ready": request.app.state.graph is not None,
+        "checkpointer": "postgres" if getattr(request.app.state, "checkpointer", None) else "none",
+        "registry_devices": registry.total() if registry else 0,
+        "policy_version": policy_config.version if policy_config else "unset",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Device Registry admin endpoints (Phase 4.1)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/registry/devices", tags=["registry"])
+async def list_registry_devices(request: Request) -> dict[str, Any]:
+    """Return the full device registry (room, zone, aliases, criticality).
+
+    In Phase 10 this will require admin auth. For now it is open for dev.
+    """
+    registry: DeviceRegistry | None = getattr(request.app.state, "registry", None)
+    if registry is None:
+        return {"devices": [], "error": "Registry not available"}
+
+    try:
+        devices = registry.to_dict_list()
+        return {"devices": devices, "total": len(devices)}
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Failed to list registry devices: %s", exc)
+        return {"devices": [], "error": "Failed to load registry"}
+
+
+@app.put("/api/registry/devices/{device_id}", tags=["registry"])
+async def update_registry_device(
+    device_id: str,
+    body: dict[str, Any],
+    request: Request,
+) -> dict[str, Any]:
+    """Update overlay metadata for a single device (room, zone, aliases, criticality).
+
+    The update is in-memory only; persist to Postgres in Phase 4.2 (not yet wired).
+    Triggers a cache refresh so the new labels are used immediately.
+    """
+    registry: DeviceRegistry | None = getattr(request.app.state, "registry", None)
+    if registry is None:
+        raise HTTPException(status_code=503, detail="Registry not available")
+
+    # Validate criticality value if provided
+    criticality = body.get("criticality")
+    if criticality is not None and criticality not in ("normal", "protected", "critical"):
+        raise HTTPException(
+            status_code=422,
+            detail={"error": {"code": "INVALID_CRITICALITY", "message": "criticality must be normal | protected | critical"}},
+        )
+
+    # Merge into the registry overlay and force refresh
+    registry._overlay[device_id] = {**registry._overlay.get(device_id, {}), **body}
+    try:
+        await registry.refresh()
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Registry refresh failed after update: %s", exc)
+
+    device = await registry.get_by_id(device_id)
+    if device is None:
+        raise HTTPException(status_code=404, detail="Device not found after refresh")
+
+    return {
+        "device_id": device.device_id,
+        "name": device.name,
+        "room": device.room,
+        "zone": device.zone,
+        "aliases": device.aliases,
+        "criticality": device.criticality,
     }
 
 
@@ -198,7 +314,6 @@ async def chat(body: ChatRequest, request: Request) -> ChatResponse:
             },
         )
 
-    settings = get_settings()
     request_id = str(uuid.uuid4())[:8]
     thread_id = body.thread_id or str(uuid.uuid4())
 

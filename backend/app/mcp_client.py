@@ -24,11 +24,11 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from langchain_core.tools import BaseTool
-from langchain_mcp_adapters.tools import load_mcp_tools
+from langchain_core.tools import BaseTool, StructuredTool
 from mcp import ClientSession
-from mcp.client.streamable_http import streamable_http
+from mcp.client.streamable_http import streamable_http_client
 from mcp.types import Tool
+from pydantic import BaseModel, Field, create_model
 
 from app.config import Settings, get_settings
 
@@ -67,13 +67,71 @@ class SchemaChangedError(RuntimeError):
 
 def _tool_schema_hash(tool: Tool) -> str:
     """Deterministic SHA-256 of (name, description, input_schema)."""
+    input_schema = getattr(tool, "input_schema", getattr(tool, "inputSchema", {}))
     payload = {
         "name": tool.name,
         "description": tool.description or "",
-        "input_schema": tool.inputSchema,
+        "input_schema": input_schema,
     }
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return "sha256:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _json_schema_to_pydantic(model_name: str, schema: dict[str, Any] | None) -> type[BaseModel]:
+    if not schema or not isinstance(schema, dict):
+        return create_model(model_name)
+    properties = schema.get("properties", {})
+    required = set(schema.get("required", []))
+    fields: dict[str, Any] = {}
+    for prop_name, prop_spec in properties.items():
+        if not isinstance(prop_spec, dict):
+            fields[prop_name] = (Any, Field(default=None))
+            continue
+        p_type = prop_spec.get("type")
+        prop_type: Any = Any
+        if p_type == "string":
+            prop_type = str
+        elif p_type == "integer":
+            prop_type = int
+        elif p_type == "number":
+            prop_type = float
+        elif p_type == "boolean":
+            prop_type = bool
+        elif p_type == "array":
+            prop_type = list
+        elif p_type == "object":
+            prop_type = dict
+        default_val = ... if prop_name in required else prop_spec.get("default", None)
+        fields[prop_name] = (
+            prop_type,
+            Field(default=default_val, description=prop_spec.get("description", "")),
+        )
+    return create_model(model_name, **fields)
+
+
+def _convert_mcp_tool_to_langchain(tool: Tool, session: ClientSession) -> BaseTool:
+    tool_name = tool.name
+
+    async def _run(**kwargs: Any) -> str:
+        res = await session.call_tool(tool_name, arguments=kwargs)
+        if getattr(res, "is_error", getattr(res, "isError", False)):
+            raise MCPToolError(f"Tool '{tool_name}' returned error: {res.content}")
+        parts = []
+        for item in res.content:
+            if hasattr(item, "text"):
+                parts.append(item.text)
+            else:
+                parts.append(str(item))
+        return "\n".join(parts)
+
+    input_schema = getattr(tool, "input_schema", getattr(tool, "inputSchema", {}))
+    model = _json_schema_to_pydantic(f"{tool_name.title().replace('_', '')}Args", input_schema)
+    return StructuredTool(
+        name=tool.name,
+        description=tool.description or "",
+        args_schema=model,
+        coroutine=_run,
+    )
 
 
 def _load_pins(path: str) -> dict[str, str]:
@@ -81,7 +139,8 @@ def _load_pins(path: str) -> dict[str, str]:
     if not p.is_file():
         return {}
     with open(p) as f:
-        return json.load(f)
+        data = json.load(f)
+        return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
 
 
 def _save_pins(path: str, pins: dict[str, str]) -> None:
@@ -156,6 +215,7 @@ class MCPClient:
         self._llm_tools: list[BaseTool] = []
         self._raw_tools: list[Tool] = []
         self._cb = _CircuitBreaker()
+        self._transport_ctx: Any = None
         self._connected = False
 
     # ------------------------------------------------------------------
@@ -174,6 +234,12 @@ class MCPClient:
             except Exception as exc:  # noqa: BLE001
                 logger.debug("MCP session close error (ignored): %s", exc)
             self._session = None
+        if hasattr(self, "_transport_ctx") and self._transport_ctx is not None:
+            try:
+                await self._transport_ctx.__aexit__(None, None, None)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("MCP transport close error (ignored): %s", exc)
+            self._transport_ctx = None
         self._connected = False
 
     @property
@@ -232,7 +298,7 @@ class MCPClient:
                 self._session.call_tool(name, arguments=arguments),
                 timeout=self.CALL_TIMEOUT_S,
             )
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             self._cb.record_failure()
             latency = int((time.monotonic() - t0) * 1000)
             logger.error(
@@ -249,7 +315,7 @@ class MCPClient:
 
         latency = int((time.monotonic() - t0) * 1000)
 
-        if result.isError:
+        if getattr(result, "is_error", getattr(result, "isError", False)):
             self._cb.record_failure()
             content_text = str(result.content) if result.content else "(no content)"
             logger.warning(
@@ -284,7 +350,7 @@ class MCPClient:
             try:
                 await asyncio.wait_for(self._do_connect(), timeout=self.CONNECT_TIMEOUT_S * 3)
                 return
-            except (asyncio.TimeoutError, Exception) as exc:
+            except (TimeoutError, Exception) as exc:
                 logger.warning(
                     "MCP connect attempt %d/%d failed: %s (backoff %.1fs)",
                     attempt,
@@ -304,21 +370,23 @@ class MCPClient:
         token = self._settings.mcp_auth_token.get_secret_value()
         headers = {"Authorization": f"Bearer {token}"}
 
-        transport = streamable_http(
-            url=self._settings.mcp_server_url,
+        client: Any = httpx.AsyncClient(
             headers=headers,
-            httpx_client_factory=lambda **kwargs: httpx.AsyncClient(
-                timeout=httpx.Timeout(
-                    connect=self.CONNECT_TIMEOUT_S,
-                    read=self.CALL_TIMEOUT_S,
-                    write=self.CALL_TIMEOUT_S,
-                    pool=self.CALL_TIMEOUT_S,
-                ),
-                **kwargs,
+            timeout=httpx.Timeout(
+                connect=self.CONNECT_TIMEOUT_S,
+                read=self.CALL_TIMEOUT_S,
+                write=self.CALL_TIMEOUT_S,
+                pool=self.CALL_TIMEOUT_S,
             ),
         )
+        self._transport_ctx = streamable_http_client(
+            url=self._settings.mcp_server_url,
+            http_client=client,
+        )
 
-        session = ClientSession(*await transport.__aenter__())
+        read_stream, write_stream = await self._transport_ctx.__aenter__()
+        session = ClientSession(read_stream, write_stream)
+        await session.__aenter__()
         await session.initialize()
 
         # Fetch all tools from the server
@@ -330,8 +398,11 @@ class MCPClient:
 
         # Build LLM tool list (read tools only, via allow-list)
         allowlist = set(self._settings.llm_tool_allowlist)
-        llm_tools = await load_mcp_tools(session)
-        safe_llm_tools = [t for t in llm_tools if t.name in allowlist]
+        safe_llm_tools = [
+            _convert_mcp_tool_to_langchain(t, session)
+            for t in raw_tools
+            if t.name in allowlist
+        ]
 
         # Safety double-check: write tool must never appear
         for tool in safe_llm_tools:

@@ -1,0 +1,30 @@
+# policy.yaml — HeatGuard AI Policy Engine Configuration
+#
+# Changes to this file require a review from the safety owner (rules.md §7.2).
+# Loosening any rule needs two reviews (rules.md §1.4).
+# The version field is stored on each plan for auditability (rules.md §2.8).
+#
+# References: architecture.md §6.3, rules.md §2.2–2.5
+
+version: "0.1"
+
+# Maximum number of devices that can be executed without human approval.
+# Setting to 1 means any multi-device write requires explicit approval.
+auto_max_devices: 1
+
+# Fleet share above which the plan is considered HIGH risk (0.0–1.0).
+# At 0.30: if >30% of all known devices are in the plan → CONFIRM + HIGH.
+fleet_share_high_risk: 0.30
+
+# Safe setpoint temperature range (Celsius).
+# Outside this range the plan is BLOCKED regardless of other rules.
+temp_min_c: 16.0
+temp_max_c: 30.0
+
+# Setpoint change above this delta requires CONFIRM (Celsius).
+temp_delta_confirm_c: 5.0
+
+# Allowed operating hours (24h clock, local time; null = no restriction).
+# Outside this window, write operations require CONFIRM or are BLOCKED per site config.
+# allowed_hours_start: 6
+# allowed_hours_end: 22
